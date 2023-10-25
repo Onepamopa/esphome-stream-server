@@ -52,10 +52,10 @@ protected:
     void publish_sensor();
 
     void accept();
-    void cleanup();
     void read();
     void flush();
     void write();
+    void cleanup();
 
     struct Client {
         Client(std::unique_ptr<esphome::socket::Socket> socket, std::string identifier, size_t position);
