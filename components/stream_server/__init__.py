@@ -9,7 +9,8 @@ AUTO_LOAD = ["socket"]
 
 DEPENDENCIES = ["uart", "network"]
 
-MULTI_CONF = True
+MULTI_CONF = False
+CONF_PROXY_TO = "proxy_to"
 
 ns = cg.global_ns
 StreamServerComponent = ns.class_("StreamServerComponent", cg.Component)
@@ -30,6 +31,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_BUFFER_SIZE, default=128): cv.All(
                 cv.positive_int, validate_buffer_size
             ),
+            cv.Required(CONF_PROXY_TO): cv.use_id(uart.UARTComponent),
         }
     )
     .extend(cv.COMPONENT_SCHEMA)
@@ -44,3 +46,5 @@ async def to_code(config):
 
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)
+    proxy_to = await cg.get_variable(config[CONF_PROXY_TO])
+    cg.add(var.set_proxy_to(proxy_to))

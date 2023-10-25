@@ -16,14 +16,14 @@ void StreamServerComponent::setup() {
     ESP_LOGCONFIG(TAG, "Setting up stream server...");
 
     // The make_unique() wrapper doesn't like arrays, so initialize the unique_ptr directly.
-    this->buf_ = std::unique_ptr<uint8_t[]>{new uint8_t[this->buf_size_]};
+    this->primary_buffer_ = std::unique_ptr<uint8_t[]>{new uint8_t[this->primary_buf_size_]};
 
     struct sockaddr_storage bind_addr;
-#if ESPHOME_VERSION_CODE >= VERSION_CODE(2023, 4, 0)
+    #if ESPHOME_VERSION_CODE >= VERSION_CODE(2023, 4, 0)
     socklen_t bind_addrlen = socket::set_sockaddr_any(reinterpret_cast<struct sockaddr *>(&bind_addr), sizeof(bind_addr), this->port_);
-#else
+    #else
     socklen_t bind_addrlen = socket::set_sockaddr_any(reinterpret_cast<struct sockaddr *>(&bind_addr), sizeof(bind_addr), htons(this->port_));
-#endif
+    #endif
 
     this->socket_ = socket::socket_ip(SOCK_STREAM, PF_INET);
     this->socket_->setblocking(false);
@@ -68,6 +68,9 @@ void StreamServerComponent::publish_sensor() {
 #endif
 }
 
+/**
+ * Accept new TCP client
+ */
 void StreamServerComponent::accept() {
     struct sockaddr_storage client_addr;
     socklen_t client_addrlen = sizeof(client_addr);
@@ -77,11 +80,14 @@ void StreamServerComponent::accept() {
 
     socket->setblocking(false);
     std::string identifier = socket->getpeername();
-    this->clients_.emplace_back(std::move(socket), identifier, this->buf_head_);
+    this->clients_.emplace_back(std::move(socket), identifier, this->primary_buf_head_);
     ESP_LOGD(TAG, "New client connected from %s", identifier.c_str());
     this->publish_sensor();
 }
 
+/**
+ * ???
+ */
 void StreamServerComponent::cleanup() {
     auto discriminator = [](const Client &client) { return !client.disconnected; };
     auto last_client = std::partition(this->clients_.begin(), this->clients_.end(), discriminator);
@@ -91,48 +97,82 @@ void StreamServerComponent::cleanup() {
     }
 }
 
+/**
+ * Read from the primary UART
+ */
 void StreamServerComponent::read() {
-    size_t len = 0;
+    size_t primary_len = 0;
     int available;
+
+    // ------------------------------------ Primary UART ------------------------------------
+    // Read, write to secondary
     while ((available = this->stream_->available()) > 0) {
-        size_t free = this->buf_size_ - (this->buf_head_ - this->buf_tail_);
+        size_t free = this->primary_buf_size_ - (this->primary_buf_head_ - this->primary_buf_tail_);
+        
         if (free == 0) {
             // Only overwrite if nothing has been added yet, otherwise give flush() a chance to empty the buffer first.
-            if (len > 0)
+            if (primary_len > 0)
                 return;
 
             ESP_LOGE(TAG, "Incoming bytes available, but outgoing buffer is full: stream will be corrupted!");
-            free = std::min<size_t>(available, this->buf_size_);
-            this->buf_tail_ += free;
+            free = std::min<size_t>(available, this->primary_buf_size_);
+            this->primary_buf_tail_ += free;
             for (Client &client : this->clients_) {
-                if (client.position < this->buf_tail_) {
-                    ESP_LOGW(TAG, "Dropped %u pending bytes for client %s", this->buf_tail_ - client.position, client.identifier.c_str());
-                    client.position = this->buf_tail_;
+                if (client.position < this->primary_buf_tail_) {
+                    ESP_LOGW(TAG, "Dropped %u pending bytes for client %s", this->primary_buf_tail_ - client.position, client.identifier.c_str());
+                    client.position = this->primary_buf_tail_;
                 }
             }
         }
 
         // Fill all available contiguous space in the ring buffer.
-        len = std::min<size_t>(available, std::min<size_t>(this->buf_ahead(this->buf_head_), free));
-        this->stream_->read_array(&this->buf_[this->buf_index(this->buf_head_)], len);
-        this->buf_head_ += len;
+        primary_len = std::min<size_t>(available, std::min<size_t>(this->buf_ahead(this->primary_buf_head_), free));
+        this->stream_->read_array(&this->primary_buffer_[this->buf_index(this->primary_buf_head_)], primary_len);
+
+        this->primary_buf_head_ += primary_len;
+
+        // Write to the secondary uart
+        this->proxy_to_->write_array(&this->primary_buffer_[this->buf_index(this->primary_buf_head_)], primary_len);
+    }
+
+    // ------------------------------------ Secondary UART ------------------------------------
+    // Read, write to primary
+    size_t secondary_len = 0;
+    int secondary_available;
+
+    while ((secondary_available = this->proxy_to_->available()) > 0) {
+      size_t free = this->secondary_buf_size_ - (this->secondary_buf_head_ - this->secondary_buf_tail_);
+
+        // Fill all available contiguous space in the ring buffer.
+        secondary_len = std::min<size_t>(secondary_available, std::min<size_t>(this->secondary_buf_ahead(this->secondary_buf_head_), free));
+        this->proxy_to_->read_array(&this->secondary_buffer_[this->secondary_buf_index(this->secondary_buf_head_)], secondary_len);
+
+        this->secondary_buf_head_ += secondary_len;
+
+        // Write to the primary uart
+        this->stream_->write_array(&this->secondary_buffer_[this->secondary_buf_index(this->secondary_buf_head_)], secondary_len);
     }
 }
 
+// Write to TCP client
 void StreamServerComponent::flush() {
     ssize_t written;
-    this->buf_tail_ = this->buf_head_;
+    this->primary_buf_tail_ = this->primary_buf_head_;
+
     for (Client &client : this->clients_) {
-        if (client.disconnected || client.position == this->buf_head_)
+        if (client.disconnected || client.position == this->primary_buf_head_) {
+            // If the client is disconnected, or has already received all data, pass
             continue;
+        }
 
         // Split the write into two parts: from the current position to the end of the ring buffer, and from the start
         // of the ring buffer until the head. The second part might be zero if no wraparound is necessary.
         struct iovec iov[2];
-        iov[0].iov_base = &this->buf_[this->buf_index(client.position)];
-        iov[0].iov_len = std::min(this->buf_head_ - client.position, this->buf_ahead(client.position));
-        iov[1].iov_base = &this->buf_[0];
-        iov[1].iov_len = this->buf_head_ - (client.position + iov[0].iov_len);
+        iov[0].iov_base = &this->primary_buffer_[this->buf_index(client.position)];
+        iov[0].iov_len = std::min(this->primary_buf_head_ - client.position, this->buf_ahead(client.position));
+        iov[1].iov_base = &this->primary_buffer_[0];
+        iov[1].iov_len = this->primary_buf_head_ - (client.position + iov[0].iov_len);
+
         if ((written = client.socket->writev(iov, 2)) > 0) {
             client.position += written;
         } else if (written == 0 || errno == ECONNRESET) {
@@ -145,12 +185,16 @@ void StreamServerComponent::flush() {
             ESP_LOGE(TAG, "Failed to write to client %s with error %d!", client.identifier.c_str(), errno);
         }
 
-        this->buf_tail_ = std::min(this->buf_tail_, client.position);
+        this->primary_buf_tail_ = std::min(this->primary_buf_tail_, client.position);
     }
 }
 
+/**
+ * Read from TCP clients, write to Primary UART
+ */
 void StreamServerComponent::write() {
-    uint8_t buf[128];
+    uint8_t buf[this->primary_buf_size_]; // 128 -> primary_buf_size_ to match what's been set
+    
     ssize_t read;
     for (Client &client : this->clients_) {
         if (client.disconnected)
