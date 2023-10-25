@@ -85,20 +85,10 @@ void StreamServerComponent::accept() {
     this->publish_sensor();
 }
 
-/**
- * ???
- */
-void StreamServerComponent::cleanup() {
-    auto discriminator = [](const Client &client) { return !client.disconnected; };
-    auto last_client = std::partition(this->clients_.begin(), this->clients_.end(), discriminator);
-    if (last_client != this->clients_.end()) {
-        this->clients_.erase(last_client, this->clients_.end());
-        this->publish_sensor();
-    }
-}
 
 /**
- * Read from the primary UART
+ * Read from the Primary UART, write to Secondary
+ * Read from Secondary UART, write to Primary
  */
 void StreamServerComponent::read() {
     size_t primary_len = 0;
@@ -154,10 +144,14 @@ void StreamServerComponent::read() {
     }
 }
 
-// Write to TCP client
+/**
+ * Write to TCP client
+ */
 void StreamServerComponent::flush() {
     ssize_t written;
     this->primary_buf_tail_ = this->primary_buf_head_;
+
+    this->secondary_buf_tail_ = this->secondary_buf_head_;
 
     for (Client &client : this->clients_) {
         if (client.disconnected || client.position == this->primary_buf_head_) {
@@ -211,6 +205,18 @@ void StreamServerComponent::write() {
         } else {
             ESP_LOGW(TAG, "Failed to read from client %s with error %d!", client.identifier.c_str(), errno);
         }
+    }
+}
+
+/**
+ * Client cleanup
+ */
+void StreamServerComponent::cleanup() {
+    auto discriminator = [](const Client &client) { return !client.disconnected; };
+    auto last_client = std::partition(this->clients_.begin(), this->clients_.end(), discriminator);
+    if (last_client != this->clients_.end()) {
+        this->clients_.erase(last_client, this->clients_.end());
+        this->publish_sensor();
     }
 }
 
