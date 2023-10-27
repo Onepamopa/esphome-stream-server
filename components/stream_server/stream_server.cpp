@@ -17,6 +17,7 @@ void StreamServerComponent::setup() {
 
     // The make_unique() wrapper doesn't like arrays, so initialize the unique_ptr directly.
     this->primary_buffer_ = std::unique_ptr<uint8_t[]>{new uint8_t[this->primary_buf_size_]};
+    this->secondary_buffer_ = std::unique_ptr<uint8_t[]>{new uint8_t[this->secondary_buf_size_]};
 
     struct sockaddr_storage bind_addr;
     #if ESPHOME_VERSION_CODE >= VERSION_CODE(2023, 4, 0)
@@ -85,6 +86,7 @@ void StreamServerComponent::accept() {
     this->publish_sensor();
 }
 
+#define MOD_RX_TX
 
 /**
  * Read from the Primary UART, write to Secondary
@@ -121,9 +123,18 @@ void StreamServerComponent::read() {
 
         this->primary_buf_head_ += primary_len;
 
+        #ifndef MOD_RX_TX
+        // Write to the secondary uart
+        this->proxy_to_->write_array(&this->primary_buffer_[this->buf_index(this->primary_buf_head_)], primary_len);
+        #endif // MOD_RX_TX
+    }
+
+    #ifdef MOD_RX_TX
+    if (available) {
         // Write to the secondary uart
         this->proxy_to_->write_array(&this->primary_buffer_[this->buf_index(this->primary_buf_head_)], primary_len);
     }
+    #endif // MOD_RX_TX
 
     // ------------------------------------ Secondary UART ------------------------------------
     // Read, write to primary
@@ -139,6 +150,13 @@ void StreamServerComponent::read() {
 
         this->secondary_buf_head_ += secondary_len;
 
+        #ifndef MOD_RX_TX
+        // Write to the primary uart
+        this->stream_->write_array(&this->secondary_buffer_[this->secondary_buf_index(this->secondary_buf_head_)], secondary_len);
+        #endif // MOD_RX_TX
+    }
+
+    if (secondary_available) {
         // Write to the primary uart
         this->stream_->write_array(&this->secondary_buffer_[this->secondary_buf_index(this->secondary_buf_head_)], secondary_len);
     }
@@ -149,8 +167,8 @@ void StreamServerComponent::read() {
  */
 void StreamServerComponent::flush() {
     ssize_t written;
+    
     this->primary_buf_tail_ = this->primary_buf_head_;
-
     this->secondary_buf_tail_ = this->secondary_buf_head_;
 
     for (Client &client : this->clients_) {
