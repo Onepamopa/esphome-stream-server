@@ -35,11 +35,11 @@ void StreamServerComponent::setup() {
 }
 
 void StreamServerComponent::loop() {
-    this->accept();
+    //this->accept();
     this->read();
-    this->flush();
-    this->write();
-    this->cleanup();
+    //this->flush();
+    //this->write();
+    //this->cleanup();
 }
 
 void StreamServerComponent::dump_config() {
@@ -171,6 +171,7 @@ void StreamServerComponent::flush() {
     this->primary_buf_tail_ = this->primary_buf_head_;
     this->secondary_buf_tail_ = this->secondary_buf_head_;
 
+    /*
     for (Client &client : this->clients_) {
         if (client.disconnected || client.position == this->primary_buf_head_) {
             // If the client is disconnected, or has already received all data, pass
@@ -199,6 +200,7 @@ void StreamServerComponent::flush() {
 
         this->primary_buf_tail_ = std::min(this->primary_buf_tail_, client.position);
     }
+    */
 }
 
 /**
